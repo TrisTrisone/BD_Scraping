@@ -1,13 +1,10 @@
-databases:
-  - name: BD_Scraping
-    plan: free
-
 services:
   # === 1️⃣ Backend (Node.js + Express + Postgres) ===
   - type: web
     name: apollo-enrichment-backend
     runtime: node
     plan: free
+    region: singapore
     buildCommand: |
       npm install
     startCommand: |
@@ -28,14 +25,13 @@ services:
       - key: ENCRYPTION_KEY
         generateValue: true
       - key: DATABASE_URL
-        fromDatabase:
-          name: BD_Scraping
-          property: connectionString
+        value: postgresql://users_4ux6_user:5GLd7EnpxSD8eEBGODUFjk5XIhyYTJdf@dpg-d45dmm8dl3ps738b63qg-a.singapore-postgres.render.com/users_4ux6
 
   # === 2️⃣ Frontend (Vite React App) ===
   - type: web
     name: apollo-enrichment-frontend
     runtime: static
+    region: singapore
     buildCommand: npm run build
     staticPublishPath: dist
     envVars:
