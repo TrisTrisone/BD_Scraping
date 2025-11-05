@@ -1,0 +1,39 @@
+previews:
+  generation: automatic
+
+services:
+  # === 1️⃣ Backend (Node.js + Express + SQLite) ===
+  - type: web
+    name: apollo-enrichment-backend
+    runtime: node
+    plan: free
+    buildCommand: |
+      npm install
+    startCommand: |
+      node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 18
+      - key: PORT
+        value: 3001
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: DB_PATH
+        value: /opt/render/project/src/db/users.db
+    disk:
+      name: sqlite-data
+      mountPath: /opt/render/project/src/db
+      sizeGB: 1
+
+  # === 2️⃣ Frontend (Vite React App) ===
+  - type: web
+    name: apollo-enrichment-frontend
+    runtime: static
+    plan: free
+    buildCommand: npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        value: https://apollo-enrichment-backend.onrender.com
