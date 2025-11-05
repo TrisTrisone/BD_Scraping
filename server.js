@@ -432,9 +432,9 @@
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import Database from "better-sqlite3";
+import { Pool } from "pg";
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { dirname } from "path";
 import https from "https";
 import dotenv from "dotenv";
 import crypto from "crypto";
@@ -453,8 +453,8 @@ app.use(express.json());
 app.use(
   cors({
     origin: [
-      "http://localhost:5173",           // local dev
-      "https://your-frontend.vercel.app" // replace with prod frontend
+      "http://localhost:5173", // local dev
+      "https://apollo-enrichment-frontend.onrender.com" // Render static frontend
     ],
     methods: ["GET", "POST", "PUT", "DELETE"],
   })
@@ -471,16 +471,12 @@ const IV_LENGTH = 16; // AES block size = 16 bytes
 
 function getEncryptionKey() {
   const raw = process.env.ENCRYPTION_KEY || "";
-  let keyBuf = null;
+  // Prefer hex input (backward compatible). If invalid, derive key via SHA-256 of raw string.
   try {
-    keyBuf = Buffer.from(raw, "hex");
+    const asHex = Buffer.from(raw, "hex");
+    if (asHex.length === 32) return asHex;
   } catch (_) {}
-  if (!keyBuf || keyBuf.length !== 32) {
-    throw new Error(
-      "ENCRYPTION_KEY must be a 64-character hex string (32 bytes)."
-    );
-  }
-  return keyBuf;
+  return crypto.createHash("sha256").update(raw).digest();
 }
 
 function encrypt(text) {
@@ -508,41 +504,33 @@ function decrypt(text) {
   return decrypted;
 }
 
+// ------------------------- Postgres Initialization -------------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.RENDER || process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : undefined,
+});
 
-// ------------------------- SQLite Initialization -------------------------
-const dbPath = process.env.DB_PATH || join(__dirname, "users.db");
-let db;
+async function query(sql, params) {
+  const res = await pool.query(sql, params);
+  return res;
+}
+
 const initializeDatabase = async () => {
-  const fs = await import("fs");
-  if (fs.default.existsSync(dbPath)) {
-    try {
-      const testDb = new Database(dbPath);
-      testDb.prepare("SELECT 1").get();
-      testDb.close();
-    } catch (err) {
-      if (err.code === "SQLITE_CORRUPT" || err.code === "SQLITE_NOTADB") {
-        console.log("⚠️ Removing corrupted database file...");
-        fs.default.unlinkSync(dbPath);
-      }
-    }
-  }
-
-  db = new Database(dbPath);
-  db.exec(`
+  await query(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       username TEXT NOT NULL UNIQUE,
       email TEXT NOT NULL UNIQUE,
       password TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('user', 'admin'))
+      role TEXT NOT NULL CHECK (role IN ('user','admin'))
     );
   `);
-  db.exec(`
+  await query(`
     CREATE TABLE IF NOT EXISTS api_keys (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       apollo_email TEXT NOT NULL,
       api_key TEXT NOT NULL UNIQUE,
-      status TEXT NOT NULL DEFAULT 'unused' CHECK(status IN ('used', 'unused'))
+      status TEXT NOT NULL DEFAULT 'unused' CHECK (status IN ('used','unused'))
     );
   `);
   console.log("✓ Database initialized");
@@ -550,22 +538,27 @@ const initializeDatabase = async () => {
 
 // ------------------------- Default Users -------------------------
 const initializeDefaultUsers = async () => {
-  const count = db.prepare("SELECT COUNT(*) as count FROM users").get().count;
+  const { rows } = await query("SELECT COUNT(*)::int AS count FROM users");
+  const count = rows[0]?.count || 0;
   if (count === 0) {
     const adminEmail = ADMIN_EMAIL || "admin@tristone-partners.com";
     const adminPassword = ADMIN_PASSWORD || "admin123";
     const hashedAdmin = await bcrypt.hash(adminPassword, 10);
-    db.prepare(
-      "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)"
-    ).run("admin", adminEmail, hashedAdmin, "admin");
+    await query(
+      "INSERT INTO users (username, email, password, role) VALUES ($1,$2,$3,$4)",
+      ["admin", adminEmail, hashedAdmin, "admin"]
+    );
 
     const hashedUser = await bcrypt.hash("user123", 10);
-    db.prepare(
-      "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)"
-    ).run("user", "user@tristone-partners.com", hashedUser, "user");
+    await query(
+      "INSERT INTO users (username, email, password, role) VALUES ($1,$2,$3,$4)",
+      ["user", "user@tristone-partners.com", hashedUser, "user"]
+    );
 
     console.log("✓ Default users created");
-  } else console.log("✓ Users table already populated");
+  } else {
+    console.log("✓ Users table already populated");
+  }
 };
 
 // ------------------------- JWT Middleware -------------------------
@@ -597,9 +590,11 @@ app.post("/api/login", async (req, res) => {
         .status(400)
         .json({ error: "Email, password, and role are required" });
 
-    const user = db
-      .prepare("SELECT * FROM users WHERE email = ? AND role = ?")
-      .get(email, role);
+    const { rows } = await query(
+      "SELECT * FROM users WHERE email = $1 AND role = $2",
+      [email, role]
+    );
+    const user = rows[0];
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
     const valid = await bcrypt.compare(password, user.password);
@@ -621,11 +616,11 @@ app.post("/api/login", async (req, res) => {
 });
 
 // ------------------------- User Management -------------------------
-app.get("/api/users", requireAuth(["admin", "user"]), (req, res) => {
-  const users = db
-    .prepare("SELECT id, username, email, role FROM users ORDER BY id")
-    .all();
-  res.json(users);
+app.get("/api/users", requireAuth(["admin", "user"]), async (req, res) => {
+  const { rows } = await query(
+    "SELECT id, username, email, role FROM users ORDER BY id"
+  );
+  res.json(rows);
 });
 
 app.post("/api/users", requireAuth(["admin", "user"]), async (req, res) => {
@@ -633,59 +628,71 @@ app.post("/api/users", requireAuth(["admin", "user"]), async (req, res) => {
   if (!username || !email || !password || !role)
     return res.status(400).json({ error: "All fields required" });
 
-  const existing = db
-    .prepare("SELECT * FROM users WHERE username = ? OR email = ?")
-    .get(username, email);
-  if (existing) return res.status(400).json({ error: "User exists" });
+  const { rows: exists } = await query(
+    "SELECT 1 FROM users WHERE username = $1 OR email = $2",
+    [username, email]
+  );
+  if (exists.length) return res.status(400).json({ error: "User exists" });
 
   const hashed = await bcrypt.hash(password, 10);
-  const result = db
-    .prepare("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)")
-    .run(username, email, hashed, role);
-  res.json({ id: result.lastInsertRowid, username, email, role });
+  const { rows } = await query(
+    "INSERT INTO users (username, email, password, role) VALUES ($1,$2,$3,$4) RETURNING id",
+    [username, email, hashed, role]
+  );
+  res.json({ id: rows[0].id, username, email, role });
 });
 
-app.delete("/api/users/:id", requireAuth(["admin", "user"]), (req, res) => {
-  const result = db.prepare("DELETE FROM users WHERE id = ?").run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: "User not found" });
+app.delete("/api/users/:id", requireAuth(["admin", "user"]), async (req, res) => {
+  const result = await query("DELETE FROM users WHERE id = $1", [req.params.id]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "User not found" });
   res.json({ message: "User deleted" });
 });
 
 // ------------------------- API Key Management -------------------------
-app.get("/api/api-keys", requireAuth(["admin", "user"]), (req, res) => {
-  const keys = db
-    .prepare("SELECT id, apollo_email, status FROM api_keys ORDER BY id")
-    .all();
-  res.json(keys);
+app.get("/api/api-keys", requireAuth(["admin", "user"]), async (req, res) => {
+  const { rows } = await query(
+    "SELECT id, apollo_email, status FROM api_keys ORDER BY id"
+  );
+  res.json(rows);
 });
 
-app.post("/api/api-keys", requireAuth(["admin", "user"]), (req, res) => {
+app.post("/api/api-keys", requireAuth(["admin", "user"]), async (req, res) => {
   const { apollo_email, api_key } = req.body;
   if (!apollo_email || !api_key)
     return res.status(400).json({ error: "Apollo email and API key required" });
 
   const encrypted = encrypt(api_key);
-  const result = db
-    .prepare("INSERT INTO api_keys (apollo_email, api_key, status) VALUES (?, ?, 'unused')")
-    .run(apollo_email, encrypted);
-  res.json({ id: result.lastInsertRowid, apollo_email, status: "unused" });
+  const { rows } = await query(
+    "INSERT INTO api_keys (apollo_email, api_key, status) VALUES ($1,$2,'unused') RETURNING id",
+    [apollo_email, encrypted]
+  );
+  res.json({ id: rows[0].id, apollo_email, status: "unused" });
 });
 
-app.put("/api/api-keys/:id/mark-used", requireAuth(["admin", "user"]), (req, res) => {
-  const result = db.prepare("UPDATE api_keys SET status='used' WHERE id=?").run(req.params.id);
-  if (!result.changes) return res.status(404).json({ error: "Key not found" });
+app.put("/api/api-keys/:id/mark-used", requireAuth(["admin", "user"]), async (req, res) => {
+  const result = await query(
+    "UPDATE api_keys SET status='used' WHERE id=$1",
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Key not found" });
   res.json({ message: "Marked as used" });
 });
 
-app.put("/api/api-keys/:id/reset", requireAuth(["admin", "user"]), (req, res) => {
-  const result = db.prepare("UPDATE api_keys SET status='unused' WHERE id=?").run(req.params.id);
-  if (!result.changes) return res.status(404).json({ error: "Key not found" });
+app.put("/api/api-keys/:id/reset", requireAuth(["admin", "user"]), async (req, res) => {
+  const result = await query(
+    "UPDATE api_keys SET status='unused' WHERE id=$1",
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Key not found" });
   res.json({ message: "Reset to unused" });
 });
 
-app.delete("/api/api-keys/:id", requireAuth(["admin", "user"]), (req, res) => {
-  const result = db.prepare("DELETE FROM api_keys WHERE id=?").run(req.params.id);
-  if (!result.changes) return res.status(404).json({ error: "Key not found" });
+app.delete("/api/api-keys/:id", requireAuth(["admin", "user"]), async (req, res) => {
+  const result = await query(
+    "DELETE FROM api_keys WHERE id=$1",
+    [req.params.id]
+  );
+  if (!result.rowCount) return res.status(404).json({ error: "Key not found" });
   res.json({ message: "Deleted" });
 });
 
@@ -715,12 +722,16 @@ const forwardToApollo = async ({ url, apolloApiKey, body }) => {
   return { status: resp.status, ok: resp.ok, json, text };
 };
 
-app.post("/api/apollo/bulk_match", requireAuth(["admin", "user"]), (req, res) => {
+app.post("/api/apollo/bulk_match", requireAuth(["admin", "user"]), async (req, res) => {
   const { apiKeyId, details } = req.body || {};
   if (!apiKeyId || !Array.isArray(details))
     return res.status(400).json({ error: "apiKeyId and details required" });
 
-const row = db.prepare("SELECT api_key FROM api_keys WHERE id=?").get(apiKeyId);
+  const { rows } = await query(
+    "SELECT api_key FROM api_keys WHERE id=$1",
+    [apiKeyId]
+  );
+  const row = rows[0];
   if (!row) return res.status(404).json({ error: "Key not found" });
 
   let decrypted = row.api_key;
@@ -736,20 +747,25 @@ const row = db.prepare("SELECT api_key FROM api_keys WHERE id=?").get(apiKeyId);
     }
   }
   const url = "https://api.apollo.io/api/v1/people/bulk_match?reveal_personal_emails=false&reveal_phone_number=false";
-  forwardToApollo({ url, apolloApiKey: decrypted, body: { details } })
-    .then(({ status, ok, json, text }) => {
-      if (!ok) res.status(status).json(json || { error: text || "Apollo error" });
-      else res.status(200).json(json || {});
-    })
-    .catch(err => res.status(502).json({ error: "Upstream error", details: err.message }));
+  try {
+    const { status, ok, json, text } = await forwardToApollo({ url, apolloApiKey: decrypted, body: { details } });
+    if (!ok) return res.status(status).json(json || { error: text || "Apollo error" });
+    return res.status(200).json(json || {});
+  } catch (err) {
+    return res.status(502).json({ error: "Upstream error", details: err.message });
+  }
 });
 
-app.post("/api/apollo/single_match", requireAuth(["admin", "user"]), (req, res) => {
+app.post("/api/apollo/single_match", requireAuth(["admin", "user"]), async (req, res) => {
   const { apiKeyId, first_name, last_name, organization_name } = req.body || {};
   if (!apiKeyId || !first_name || !last_name)
     return res.status(400).json({ error: "Missing fields" });
 
-const row = db.prepare("SELECT api_key FROM api_keys WHERE id=?").get(apiKeyId);
+  const { rows } = await query(
+    "SELECT api_key FROM api_keys WHERE id=$1",
+    [apiKeyId]
+  );
+  const row = rows[0];
   if (!row) return res.status(404).json({ error: "Key not found" });
 
   let decrypted = row.api_key;
@@ -768,12 +784,13 @@ const row = db.prepare("SELECT api_key FROM api_keys WHERE id=?").get(apiKeyId);
   const payload = { first_name, last_name };
   if (organization_name) payload.organization_name = organization_name;
 
-  forwardToApollo({ url, apolloApiKey: decrypted, body: payload })
-    .then(({ status, ok, json, text }) => {
-      if (!ok) res.status(status).json(json || { error: text || "Apollo error" });
-      else res.status(200).json(json || {});
-    })
-    .catch(err => res.status(502).json({ error: "Upstream error", details: err.message }));
+  try {
+    const { status, ok, json, text } = await forwardToApollo({ url, apolloApiKey: decrypted, body: payload });
+    if (!ok) return res.status(status).json(json || { error: text || "Apollo error" });
+    return res.status(200).json(json || {});
+  } catch (err) {
+    return res.status(502).json({ error: "Upstream error", details: err.message });
+  }
 });
 
 // ------------------------- Start Server -------------------------
@@ -784,10 +801,18 @@ const row = db.prepare("SELECT api_key FROM api_keys WHERE id=?").get(apiKeyId);
     process.exit(1);
   }
   try {
-    // Validate encryption key format early
+    // Validate encryption key format early (will derive if not hex)
     getEncryptionKey();
   } catch (e) {
     console.error(e.message);
+    process.exit(1);
+  }
+
+  // Ensure DB connectivity early
+  try {
+    await pool.query("SELECT 1");
+  } catch (e) {
+    console.error("Failed to connect to Postgres:", e.message);
     process.exit(1);
   }
 
