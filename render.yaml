@@ -4,7 +4,6 @@ services:
     name: apollo-enrichment-backend
     runtime: node
     plan: free
-    region: singapore
     buildCommand: |
       npm install
     startCommand: |
@@ -31,7 +30,6 @@ services:
   - type: web
     name: apollo-enrichment-frontend
     runtime: static
-    region: singapore
     buildCommand: npm run build
     staticPublishPath: dist
     envVars:
