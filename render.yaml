@@ -20,9 +20,9 @@ services:
       - key: ADMIN_PASSWORD
         value: admin123
       - key: JWT_SECRET
-        generateValue: true
+        value: 711d8e2ef7f3254c39dd2ec7cb8a8876a09da18790a6f8777450f69c27b8fbb5
       - key: ENCRYPTION_KEY
-        generateValue: true
+        value: 90767df0d88a61ccf36ce7e50a7a1e0812eff5f6837038b65adb31009f0c764c
       - key: DATABASE_URL
         value: postgresql://users_4ux6_user:5GLd7EnpxSD8eEBGODUFjk5XIhyYTJdf@dpg-d45dmm8dl3ps738b63qg-a.singapore-postgres.render.com/users_4ux6
 

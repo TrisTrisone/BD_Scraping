@@ -785,7 +785,7 @@ const ApolloEnrichmentApp = () => {
       // Flexible header detection
       let headerRow = null;
       let headerRowIndex = -1;
-      const headerKeywords = ['first name', 'last name', 'name', 'company', 'firstname', 'lastname', 'fname', 'lname'];
+      const headerKeywords = ['first name', 'last name', 'name', 'company', 'firstname', 'lastname', 'fname', 'lname','companies'];
       for (let i = 0; i < Math.min(10, jsonData.length); i++) {
         const row = jsonData[i];
         if (!row || !Array.isArray(row)) continue;
